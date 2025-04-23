@@ -85,7 +85,7 @@ if "trained" not in st.session_state:
     st.session_state.trained = False
 
 if not st.session_state.trained:
-    if st.button("▶️ Train TCN"):
+    if st.button("Train TCN"):
         st.session_state.trained = True
     else:
         st.info("Click **Train TCN** to start training.")
