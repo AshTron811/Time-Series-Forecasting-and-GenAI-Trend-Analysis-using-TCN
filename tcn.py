@@ -1,5 +1,5 @@
 import os
-os.environ["PL_DISABLE_DYNAMO"] = "1"
+os.environ["PL_DISABLE_DYNAMO"] = "1"  # Disable TorchDynamo compilation
 
 import numpy as np
 import pandas as pd
@@ -8,12 +8,12 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 from pytorch_lightning import Trainer, LightningModule
-from pytorch_tcn import TCN  # pip install pytorch‑tcn :contentReference[oaicite:1]{index=1}
+from pytorch_tcn import TCN
 
 # ————————————————————————————————
 # Streamlit UI
 # ————————————————————————————————
-st.title("Sliding‑Window Forecasting with TCN")
+st.title("Sliding-Window Forecasting with TCN + GenAI Trend Debug")
 
 # 1) Upload CSV
 uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
@@ -34,17 +34,17 @@ df[date_col] = pd.to_datetime(df[date_col])
 df = df.sort_values(date_col).reset_index(drop=True)
 series = df[target_col].values.astype(float)
 
-# user‑selectable window & horizon
-lookback = st.slider("Look‑back window size", 5, 50, 12)
+# user-selectable window & horizon
+lookback = st.slider("Look-back window size", 5, 50, 12)
 horizon  = st.slider("Forecast horizon (steps)", 1, 252, 30)
 
-# 2) Build sliding‑window dataset
-X, y = [], []
+# 2) Build sliding-window dataset
+X_list, y_list = [], []
 for i in range(len(series) - lookback):
-    X.append(series[i : i + lookback])
-    y.append(series[i + lookback])
-X = torch.tensor(np.stack(X), dtype=torch.float32)
-y = torch.tensor(y, dtype=torch.float32)
+    X_list.append(series[i : i + lookback])
+    y_list.append(series[i + lookback])
+X = torch.tensor(np.stack(X_list), dtype=torch.float32)
+y = torch.tensor(y_list, dtype=torch.float32)
 dataset = TensorDataset(X, y)
 loader  = DataLoader(dataset, batch_size=16, shuffle=True)
 
@@ -64,10 +64,9 @@ class TCNForecaster(LightningModule):
         self.loss_fn = torch.nn.MSELoss()
 
     def forward(self, x):
-        # x: (batch, seq_len) → (batch, 1, seq_len)
-        x = x.unsqueeze(1)
-        out = self.tcn(x)               # (batch, channel, seq_len)
-        out = out[:, :, -1]             # take last timestep → (batch, channel)
+        x = x.unsqueeze(1)                # (batch, 1, seq_len)
+        out = self.tcn(x)                 # (batch, channel, seq_len)
+        out = out[:, :, -1]               # (batch, channel)
         return self.linear(out).squeeze(-1)  # (batch,)
 
     def training_step(self, batch, _):
@@ -85,7 +84,7 @@ if "trained" not in st.session_state:
     st.session_state.trained = False
 
 if not st.session_state.trained:
-    if st.button("Train TCN"):
+    if st.button("▶️ Train TCN"):
         st.session_state.trained = True
     else:
         st.info("Click **Train TCN** to start training.")
@@ -102,15 +101,16 @@ with st.spinner("Training TCN model…"):
     trainer.fit(model, loader)
 st.success("Training complete!")
 
-# 5) Iterative multi‑step forecast
+# 5) Iterative multi-step forecast
 window = series[-lookback:].tolist()
 preds = []
-for _ in range(horizon):
-    x_in = torch.tensor(window[-lookback:], dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
+model.eval()
+with torch.no_grad():
+    for _ in range(horizon):
+        x_in = torch.tensor(window[-lookback:], dtype=torch.float32).unsqueeze(0)
         next_val = model(x_in).item()
-    preds.append(next_val)
-    window.append(next_val)
+        preds.append(next_val)
+        window.append(next_val)
 
 # Build future dates
 last_date = df[date_col].iloc[-1]
@@ -127,53 +127,60 @@ plt.ylabel(target_col)
 plt.legend()
 st.pyplot(plt.gcf())
 
-# 7) In‑sample RMSE (no .numpy() at all)
-from torchmetrics import MeanSquaredError
-
-# switch to eval mode
+# 7) In-sample RMSE (pure PyTorch)
 model.eval()
-
-# pick one: either use torchmetrics…
-rmse_metric = MeanSquaredError(squared=False)   # √MSE
-
 with torch.no_grad():
-    # forward pass
-    preds_tensor = model(X)                    # shape (n_samples,)
-    # update metric (this also detaches internally)
-    rmse_value = rmse_metric(preds_tensor, y).item()
+    preds_tensor = model(X)
+    mse   = torch.mean((preds_tensor - y) ** 2)
+    rmse  = torch.sqrt(mse).item()
+st.write(f"**In-sample RMSE**: {rmse:.4f}")
 
-# …or roll your own in pure PyTorch:
-# with torch.no_grad():
-#     preds_tensor = model(X)
-#     mse = torch.mean((preds_tensor - y) ** 2)
-#     rmse_value = torch.sqrt(mse).item()
+# ——————————————————————————————————————————————————————————
+# GenAI Trend Summary (debugging token & HTTP error)
+# ——————————————————————————————————————————————————————————
 
-st.write(f"**In‑sample RMSE**: {rmse_value:.4f}")
+# 1) List loaded secrets
+st.write("All secrets keys:", list(st.secrets.keys()))
 
-# 8) GenAI Trend Summary (unchanged)
-st.subheader("GenAI Trend Summary")
+# 2) Retrieve and mask token
+token = st.secrets.get("HUGGINGFACEHUB_API_TOKEN")
+st.write("Token present?", bool(token))
+if token:
+    st.write("Token prefix (first 8 chars):", token[:8] + "…")
+else:
+    st.error("No HuggingFace token found. Check .streamlit/secrets.toml.")
+    st.stop()
+
+# 3) Initialize the HuggingFaceHub LLM
 from langchain.llms import HuggingFaceHub
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-
-HUGGINGFACEHUB_API_TOKEN = st.secrets["HUGGINGFACEHUB_API_TOKEN"]
 hf_llm = HuggingFaceHub(
     repo_id="mistralai/Mistral-7B-Instruct-v0.3",
     task="text-generation",
+    huggingfacehub_api_token=token,
     model_kwargs={"temperature":0.7, "max_new_tokens":200},
-    huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
 )
+
+# 4) Build prompt and chain
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+
 prompt = PromptTemplate(
     input_variables=["last_actual","first_forecast"],
     template=(
         "Last observed value: {last_actual:.2f}. "
         "First forecast step: {first_forecast:.2f}. "
-        "Provide a concise, plain‑English summary of the trend."
+        "Provide a concise, plain-English summary of the trend."
     )
 )
-chain   = LLMChain(prompt=prompt, llm=hf_llm)
-summary = chain.run(
-    last_actual    = series[-1],
-    first_forecast = preds[0]
-)
-st.write(summary)
+chain = LLMChain(prompt=prompt, llm=hf_llm)
+
+# 5) Call the chain with error capture
+try:
+    summary = chain.run(
+        last_actual    = df[target_col].iloc[-1],
+        first_forecast = preds[0]
+    )
+    st.write(summary)
+except Exception as e:
+    st.error(f"HuggingFace API call failed: {e.__class__.__name__}: {e}")
+    st.stop()
